@@ -1,88 +1,41 @@
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import logging
+import os
+from app.api.v1.router import router as api_router
+from app.core.startup import initialize_model_registry
 
-from app.core.config import settings
-from app.core.logger import logger
-from app.api.routes import router
-from app.models.model_loader import model_loader
-
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Lifespan context manager for startup and shutdown events
+    Startup and shutdown events for FastAPI app.
+    Loads model, encoders, and preprocessing artifacts from model_registry on startup.
     """
-    # Startup: Load model
-    logger.info("="*60)
-    logger.info(f"Starting {settings.application.APP_NAME} v{settings.application.APP_VERSION}")
-    logger.info("="*60)
-    
-    logger.info("Loading model from registry...")
-    model_loaded = model_loader.load_latest_model()
-    
-    if model_loaded:
-        logger.info("Model loaded successfully")
-        model_info = model_loader.get_model_info()
-        logger.info(f"  - Version: {model_info['version']}")
-        logger.info(f"  - Type: {model_info['model_type']}")
-        logger.info(f"  - File: {model_info['model_file']}")
-    else:
-        logger.warning("✗ Failed to load model - predictions will not be available")
-    
-    logger.info("="*60)
-    logger.info(f"API is ready at http://{settings.api.HOST}:{settings.api.PORT}")
-    logger.info(f"Documentation available at http://{settings.api.HOST}:{settings.api.PORT}/docs")
-    logger.info("="*60)
+    # Startup
+    logger.info("Starting up Customer Churn API...")
+    try:
+        initialize_model_registry()
+        logger.info("✓ Model registry initialized successfully")
+    except Exception as e:
+        logger.error(f"✗ Failed to initialize model registry: {e}")
+        raise
     
     yield
     
     # Shutdown
-    logger.info("Shutting down application...")
+    logger.info("Shutting down Customer Churn API...")
 
-
-# Create FastAPI application
 app = FastAPI(
-    title=settings.application.APP_NAME,
-    description="ML-powered API for predicting customer churn",
-    version=settings.application.APP_VERSION,
-    lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json"
+    title="Customer Churn API",
+    description="API for predicting customer churn",
+    version="1.0.0",
+    lifespan=lifespan
 )
 
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.include_router(api_router, prefix="/api/v1")
 
-# Include API router
-app.include_router(router, prefix=settings.api.API_PREFIX)
-
-
-@app.get("/", tags=["Root"])
-async def root():
-    """Root endpoint"""
-    return {
-        "message": f"Welcome to {settings.application.APP_NAME}",
-        "version": settings.application.APP_VERSION,
-        "docs": f"{settings.api.API_PREFIX}/docs",
-        "health": f"{settings.api.API_PREFIX}/health"
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    
-    uvicorn.run(
-        "main:app",
-        host=settings.api.HOST,
-        port=settings.api.PORT,
-        reload=settings.application.DEBUG,
-        log_level=settings.logging.LOG_LEVEL.lower()
-    )
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "Customer Churn Prediction API"}

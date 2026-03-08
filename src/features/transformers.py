@@ -36,6 +36,25 @@ class MissingValueImputer(BaseEstimator, TransformerMixin):
         return X
 
 
+class ColumnExcluder(BaseEstimator, TransformerMixin):
+    """
+    Exclude specified columns from the dataset
+    """
+    
+    def __init__(self, exclude_columns=None):
+        self.exclude_columns = exclude_columns or []
+    
+    def fit(self, X, y=None):
+        return self
+    
+    def transform(self, X):
+        X = X.copy()
+        cols_to_exclude = [col for col in self.exclude_columns if col in X.columns]
+        if cols_to_exclude:
+            X = X.drop(columns=cols_to_exclude)
+        return X
+
+
 class FeatureGenerator(BaseEstimator, TransformerMixin):
     """
     Create domain-based engineered features
@@ -48,19 +67,22 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
 
         X = X.copy()
 
-        # Average charge per tenure month
-        X["avg_monthly_value"] = (
-            X["total_charges"] / (X["tenure_months"] + 1)
-        )
+        # Average charge per tenure month (if columns exist)
+        if "total_charges" in X.columns and "tenure_months" in X.columns:
+            X["avg_monthly_value"] = (
+                X["total_charges"] / (X["tenure_months"] + 1)
+            )
 
-        # Support intensity
-        X["support_call_ratio"] = (
-            X["support_calls"] / (X["tenure_months"] + 1)
-        )
+        # Support intensity (if columns exist)
+        if "support_calls" in X.columns and "tenure_months" in X.columns:
+            X["support_call_ratio"] = (
+                X["support_calls"] / (X["tenure_months"] + 1)
+            )
 
-        # Payment risk indicator
-        X["payment_risk"] = np.where(
-            X["late_payments"] > 2, 1, 0
-        )
+        # Payment risk indicator (if columns exist)
+        if "late_payments" in X.columns:
+            X["payment_risk"] = np.where(
+                X["late_payments"] > 2, 1, 0
+            )
 
         return X

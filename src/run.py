@@ -76,7 +76,8 @@ class PipelineRunner:
             # =====================================================
             logger.info("STEP 3: Feature engineering")
 
-            feature_builder = FeatureBuilder(self.config)
+            exclude_cols = self.config.get("training", {}).get("exclude_columns", [])
+            feature_builder = FeatureBuilder(self.config, exclude_columns=exclude_cols)
             processed_df = feature_builder.build(raw_df)
 
             logger.info(

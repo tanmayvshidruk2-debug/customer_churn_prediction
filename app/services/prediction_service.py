@@ -1,114 +1,104 @@
 import pandas as pd
-import numpy as np
-from typing import Tuple
+import logging
+from typing import Dict
+import traceback
 
-from app.core.config import settings
-from app.core.logger import logger
-from app.models.model_loader import model_loader
-from app.schemas.request import CustomerData
-from app.schemas.response import PredictionResponse
-
+logger = logging.getLogger(__name__)
 
 class PredictionService:
-    """Service for handling prediction logic"""
+    """
+    Service for making predictions using the trained XGBoost model.
+    Uses preprocessing aligned with src.features transformers.
+    """
     
-    @staticmethod
-    def _determine_risk_level(probability: float) -> str:
+    def __init__(self, model=None, encoders=None, exclude_columns=None):
         """
-        Determine risk level based on churn probability
+        Initialize prediction service.
         
         Args:
-            probability: Churn probability (0-1)
-            
-        Returns:
-            Risk level string
+            model: Trained model object
+            encoders: Dictionary of fitted encoders for categorical variables
+            exclude_columns: List of columns to exclude from prediction
         """
-        if probability >= 0.7:
-            return "High"
-        elif probability >= 0.4:
-            return "Medium"
-        else:
-            return "Low"
+        self.model = model
+        self.encoders = encoders
+        self.exclude_columns = exclude_columns or [
+            "customer_id", "age", "monthly_charges", "Date",
+            "avg_monthly_value", "support_call_ratio", "payment_risk"
+        ]
+        
+        # Initialize preprocessing service with loaded artifacts
+        from app.services.preprocessing_service import PreprocessingService
+        self.preprocessing_service = PreprocessingService(
+            encoders=self.encoders,
+            exclude_columns=self.exclude_columns
+        )
+        
+        if self.model:
+            logger.info(f"PredictionService initialized with model: {type(self.model).__name__}")
     
-    @staticmethod
-    def _preprocess_input(customer: CustomerData) -> pd.DataFrame:
+    def predict(
+        self,
+        data: pd.DataFrame,
+        return_probability: bool = True
+    ) -> Dict:
         """
-        Convert customer data to DataFrame for model input
+        Make predictions on input data.
         
         Args:
-            customer: Customer data
-            
+            data: DataFrame with customer features
+            return_probability: If True, return probability; if False, return class prediction
+        
         Returns:
-            DataFrame with customer features
+            Dictionary with predictions and probabilities
         """
-        # Convert to dict and create DataFrame
-        customer_dict = customer.model_dump()
-        customer_id = customer_dict.pop('customer_id')
-        
-        df = pd.DataFrame([customer_dict])
-        
-        logger.debug(f"Preprocessed input for customer {customer_id}: {df.to_dict()}")
-        
-        return df, customer_id
-    
-    @staticmethod
-    def predict(customer: CustomerData) -> PredictionResponse:
-        """
-        Make churn prediction for a customer
-        
-        Args:
-            customer: Customer data
-            
-        Returns:
-            Prediction response
-            
-        Raises:
-            ValueError: If model is not loaded
-            Exception: If prediction fails
-        """
-        if not model_loader.is_loaded():
-            logger.error("Prediction attempted but model is not loaded")
-            raise ValueError("Model is not loaded. Please check model registry.")
+        if self.model is None:
+            raise ValueError("Model not loaded. Please initialize with a valid model.")
         
         try:
-            # Preprocess input
-            df, customer_id = PredictionService._preprocess_input(customer)
+            logger.debug(f"Preprocessing {len(data)} samples")
+            # Preprocess data using src transformers pipeline
+            processed_data = self.preprocessing_service.preprocess(data)
             
-            # Apply preprocessor if available
-            if model_loader.preprocessor is not None:
-                logger.debug("Applying preprocessor to input data")
-                X = model_loader.preprocessor.transform(df)
-            else:
-                X = df.values
+            logger.debug(f"Making predictions on {len(processed_data)} samples")
+            # Make predictions
+            predictions = self.model.predict(processed_data)
             
-            # Make prediction
-            prediction = model_loader.model.predict(X)[0]
+            result = {
+                "predictions": predictions.tolist() if hasattr(predictions, 'tolist') else predictions,
+                "n_samples": len(processed_data)
+            }
             
-            # Get probability
-            if hasattr(model_loader.model, 'predict_proba'):
-                probability = model_loader.model.predict_proba(X)[0][1]
-            else:
-                probability = float(prediction)
+            # Add probabilities if model supports predict_proba
+            if return_probability and hasattr(self.model, "predict_proba"):
+                probabilities = self.model.predict_proba(processed_data)
+                result["churn_probability"] = probabilities[:, 1].tolist()
+                result["no_churn_probability"] = probabilities[:, 0].tolist()
             
-            # Determine risk level
-            risk_level = PredictionService._determine_risk_level(probability)
-            
-            logger.info(f"Prediction for customer {customer_id}: "
-                       f"churn={prediction}, probability={probability:.4f}, risk={risk_level}")
-            
-            return PredictionResponse(
-                customer_id=customer_id,
-                churn_prediction=int(prediction),
-                churn_probability=float(probability),
-                risk_level=risk_level,
-                model_version=model_loader.model_version
-            )
-            
+            return result
         except Exception as e:
-            logger.error(f"Prediction failed for customer {customer.customer_id}: {str(e)}", 
-                        exc_info=True)
-            raise Exception(f"Prediction failed: {str(e)}")
+            logger.error(f"Error during prediction: {e}")
+            logger.error(traceback.format_exc())
+            raise
+    
+    def predict_single(self, data_dict: Dict) -> Dict:
+        """
+        Make prediction for a single sample.
+        
+        Args:
+            data_dict: Dictionary with customer features
+        
+        Returns:
+            Dictionary with prediction and probability
+        """
+        df = pd.DataFrame([data_dict])
+        result = self.predict(df, return_probability=True)
+        
+        return {
+            "prediction": result["predictions"][0],
+            "churn_probability": result.get("churn_probability", [0])[0],
+            "no_churn_probability": result.get("no_churn_probability", [1])[0]
+        }
 
+        
 
-# Global service instance
-prediction_service = PredictionService()

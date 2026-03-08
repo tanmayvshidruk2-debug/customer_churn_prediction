@@ -15,8 +15,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.impute import SimpleImputer
+from xgboost import XGBClassifier
+from imblearn.over_sampling import SMOTE
 
 from src.logger.logger import get_logger
 from src.schema.train_schema import TrainConfig
@@ -48,7 +50,11 @@ class Trainer:
     # =========================================================
     # Pipeline Builder
     # =========================================================
-    def _build_pipeline(self, X: pd.DataFrame) -> Pipeline:
+    def _build_pipeline(self, X: pd.DataFrame) -> Tuple[Pipeline, Dict]:
+        """
+        Build preprocessing pipeline with LabelEncoder for categorical variables.
+        Returns pipeline and mapping of categorical features to their encoders.
+        """
 
         numeric_features = X.select_dtypes(
             include=["int64", "float64"]
@@ -61,6 +67,13 @@ class Trainer:
         logger.info(f"Numeric features: {numeric_features}")
         logger.info(f"Categorical features: {categorical_features}")
 
+        # Create label encoders for categorical features
+        categorical_encoders = {}
+        for cat_feature in categorical_features:
+            le = LabelEncoder()
+            le.fit(X[cat_feature].astype(str))
+            categorical_encoders[cat_feature] = le
+
         numeric_transformer = Pipeline(
             steps=[
                 ("imputer", SimpleImputer(strategy="median")),
@@ -68,52 +81,27 @@ class Trainer:
             ]
         )
 
-        categorical_transformer = Pipeline(
-            steps=[
-                ("imputer", SimpleImputer(strategy="most_frequent")),
-                (
-                    "encoder",
-                    OneHotEncoder(
-                        handle_unknown="ignore",
-                        sparse_output=False
-                    )
-                )
-            ]
-        )
-
+        # For categorical features, we'll use a custom transformer
         preprocessor = ColumnTransformer(
             transformers=[
                 ("num", numeric_transformer, numeric_features),
-                ("cat", categorical_transformer, categorical_features)
             ],
             remainder="drop"
         )
 
-        model_type = self.config.model.type
         model_config = self.config.model
 
-        if model_type == "random_forest":
+        if model_config.type != "xgboost":
+            raise ValueError(f"Only XGBoost is supported. Got: {model_config.type}")
 
-            rf_params = model_config.random_forest.dict()
+        xgb_params = model_config.xgboost.dict()
 
-            model = RandomForestClassifier(
-                **rf_params,
-                random_state=self.config.random_state
-            )
+        model = XGBClassifier(
+            **xgb_params,
+            eval_metric='logloss'
+        )
 
-        elif model_type == "logistic_regression":
-
-            lr_params = model_config.logistic_regression.dict()
-
-            model = LogisticRegression(
-                **lr_params,
-                random_state=self.config.random_state
-            )
-
-        else:
-            raise ValueError(f"Unsupported model type: {model_type}")
-
-        logger.info(f"Using model: {model_type}")
+        logger.info(f"Using model: {model_config.type}")
 
         pipeline = Pipeline(
             steps=[
@@ -122,7 +110,7 @@ class Trainer:
             ]
         )
 
-        return pipeline
+        return pipeline, categorical_encoders
 
     # =========================================================
     # Extract Transformed Feature Names
@@ -137,7 +125,8 @@ class Trainer:
     def _extract_model_metadata(
         self,
         pipeline: Pipeline,
-        feature_names: list
+        feature_names: list,
+        categorical_encoders: Dict = None
     ) -> Dict[str, Any]:
 
         model = pipeline.named_steps["model"]
@@ -162,6 +151,9 @@ class Trainer:
             metadata["coefficients"] = dict(
                 zip(feature_names, model.coef_[0].tolist())
             )
+
+        if categorical_encoders:
+            metadata["categorical_features"] = list(categorical_encoders.keys())
 
         return metadata
 
@@ -230,14 +222,32 @@ class Trainer:
                 f"Target column '{self.config.target_column}' not found"
             )
 
-        X = df.drop(columns=[self.config.target_column])
+        # Exclude specified columns
+        exclude_cols = self.config.exclude_columns or []
+        exclude_cols = exclude_cols + [self.config.target_column]
+        
+        logger.info(f"Excluding columns: {exclude_cols}")
+        
+        X = df.drop(columns=[col for col in exclude_cols if col in df.columns])
         y = df[self.config.target_column]
 
-        # -----------------------------------------------------
+        logger.info(f"Features shape: {X.shape}, Target shape: {y.shape}")
+
+        # Encode categorical variables
+        categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+        X_encoded = X.copy()
+        
+        categorical_encoders = {}
+        for cat_col in categorical_cols:
+            le = LabelEncoder()
+            X_encoded[cat_col] = le.fit_transform(X_encoded[cat_col].astype(str))
+            categorical_encoders[cat_col] = le
+        
+        logger.info(f"Encoded categorical columns: {categorical_cols}")
+
         # Train-Test Split
-        # -----------------------------------------------------
         X_train, X_test, y_train, y_test = train_test_split(
-            X,
+            X_encoded,
             y,
             test_size=self.config.test_size,
             random_state=self.config.random_state,
@@ -246,11 +256,22 @@ class Trainer:
 
         logger.info("Train-test split completed")
 
-        pipeline = self._build_pipeline(X_train)
+        # Apply SMOTE if enabled
+        if self.config.apply_smote:
+            logger.info("Applying SMOTE for class balancing")
+            smote = SMOTE(
+                k_neighbors=self.config.smote_k_neighbors,
+                random_state=self.config.random_state
+            )
+            X_train, y_train = smote.fit_resample(X_train, y_train)
+            logger.info(f"SMOTE applied. New training set shape: {X_train.shape}")
 
-        # -----------------------------------------------------
+        pipeline, cat_encoders = self._build_pipeline(X_train)
+
+        # Store encoders for later use during prediction
+        self.categorical_encoders = categorical_encoders
+
         # Stratified K-Fold Cross Validation
-        # -----------------------------------------------------
         logger.info("Starting Stratified K-Fold Cross Validation")
         cv_metrics = self.model_cross_validation(
             pipeline,
@@ -259,26 +280,19 @@ class Trainer:
         )
         logger.info("Cross validation completed: %s", cv_metrics)
 
-
-        # -----------------------------------------------------
         # Final Training on Full Training Data
-        # -----------------------------------------------------
         pipeline.fit(X_train, y_train)
 
         logger.info("Final model training completed")
 
-        # -----------------------------------------------------
         # Evaluation on Hold-out Test Set
-        # -----------------------------------------------------
         evaluator = Evaluator()
 
         predictions = pipeline.predict(X_test)
 
         metrics = evaluator.evaluate(y_test, predictions)
 
-        # -----------------------------------------------------
         # Versioned Model Saving
-        # -----------------------------------------------------
         version = datetime.now().strftime("%Y%m%d_%H%M%S")
         version_path = os.path.join(
             self.registry_path,
@@ -292,6 +306,11 @@ class Trainer:
 
         logger.info(f"Model saved at {model_path}")
 
+        # Save categorical encoders
+        encoders_path = os.path.join(version_path, "encoders.pkl")
+        joblib.dump(categorical_encoders, encoders_path)
+        logger.info(f"Categorical encoders saved at {encoders_path}")
+
         # Save predictions
         predictions_df = pd.DataFrame({
             "y_true": y_test.values,
@@ -304,18 +323,19 @@ class Trainer:
 
         evaluator.save_report(metrics, version_path)
 
-        # -----------------------------------------------------
         # Metadata Saving
-        # -----------------------------------------------------
-        feature_names = self._get_feature_names(pipeline)
+        feature_names = X_train.columns.tolist()
 
         metadata = self._extract_model_metadata(
             pipeline,
-            feature_names
+            feature_names,
+            categorical_encoders
         )
 
         metadata["test_metrics"] = metrics.dict()
         metadata["cross_validation_metrics"] = cv_metrics
+        metadata["excluded_columns"] = self.config.exclude_columns or []
+        metadata["smote_applied"] = self.config.apply_smote
 
         metadata_path = os.path.join(version_path, "model.yaml")
 

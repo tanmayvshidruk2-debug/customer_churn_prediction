@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 
 class LogisticRegressionConfig(BaseModel):
@@ -21,10 +21,21 @@ class RandomForestConfig(BaseModel):
     n_jobs: int = -1
 
 
+class XGBoostConfig(BaseModel):
+    n_estimators: int = 200
+    max_depth: int = 6
+    learning_rate: float = 0.1
+    subsample: float = 0.8
+    colsample_bytree: float = 0.8
+    random_state: int = 42
+    n_jobs: Optional[int] = -1
+
+
 class ModelConfig(BaseModel):
     type: str
-    logistic_regression: Optional[LogisticRegressionConfig]
-    random_forest: Optional[RandomForestConfig]
+    logistic_regression: Optional[LogisticRegressionConfig] = None
+    random_forest: Optional[RandomForestConfig] = None
+    xgboost: Optional[XGBoostConfig] = None
 
 
 class TrainConfig(BaseModel):
@@ -34,4 +45,7 @@ class TrainConfig(BaseModel):
     test_size: float
     target_column: str
     cross_validation_folds: int
+    exclude_columns: Optional[List[str]] = None
+    apply_smote: bool = False
+    smote_k_neighbors: int = 5
     model: ModelConfig
